@@ -1,0 +1,123 @@
+---
+title: "What's Cooking Challenge"
+author: "Daniel Crofts"
+format: html
+editor: visual
+---
+
+## Data and Libraries
+
+```{r}
+library(jsonlite)
+library(tidyverse)
+library(tidytext)
+library(tidymodels)
+library(stringr)
+
+train_raw <- fromJSON("train.json")
+test_raw  <- fromJSON("test.json")
+
+
+train_tidy <- train_raw %>%
+  unnest(ingredients) %>%
+  rename(ingredient = ingredients)
+
+test_tidy <- test_raw %>%
+  unnest(ingredients) %>%
+  rename(ingredient = ingredients)
+```
+
+## Feature Engineering
+```{r}
+
+# ---- Feature 1: number of ingredients ----
+feat_count_train <- train_tidy %>%
+  group_by(id, cuisine) %>%
+  summarize(num_ingredients = n(), .groups = "drop")
+
+feat_count_test <- test_tidy %>%
+  group_by(id) %>%
+  summarize(num_ingredients = n(), .groups = "drop")
+
+# ---- Feature 2: presence of soy sauce ----
+feat_soy_train <- train_tidy %>%
+  mutate(has_soy = ingredient == "soy sauce") %>%
+  group_by(id, cuisine) %>%
+  summarize(has_soy = as.integer(any(has_soy)), .groups = "drop")
+
+feat_soy_test <- test_tidy %>%
+  mutate(has_soy = ingredient == "soy sauce") %>%
+  group_by(id) %>%
+  summarize(has_soy = as.integer(any(has_soy)), .groups = "drop")
+
+# ---- Feature 3: Bag-of-words for top 200 ingredients ----
+top200 <- train_tidy %>%
+  count(ingredient, sort = TRUE) %>%
+  slice_head(n = 200) %>%
+  pull(ingredient)
+
+feat_bow_train <- train_tidy %>%
+  mutate(ingredient = if_else(ingredient %in% top200, ingredient, "OTHER")) %>%
+  count(id, cuisine, ingredient) %>%
+  pivot_wider(
+    names_from = ingredient,
+    values_from = n,
+    values_fill = 0
+  )
+
+feat_bow_test <- test_tidy %>%
+  mutate(ingredient = if_else(ingredient %in% top200, ingredient, "OTHER")) %>%
+  count(id, ingredient) %>%
+  pivot_wider(
+    names_from = ingredient,
+    values_from = n,
+    values_fill = 0
+  )
+
+# -----------------------------
+# 4. Combine all feature sets
+# -----------------------------
+train_df <- feat_bow_train %>%
+  left_join(feat_count_train, by = c("id", "cuisine")) %>%
+  left_join(feat_soy_train, by = c("id", "cuisine"))
+
+test_df <- feat_bow_test %>%
+  left_join(feat_count_test, by = "id") %>%
+  left_join(feat_soy_test, by = "id")
+
+
+```
+
+## RF Model
+
+```{r}
+rf_model <- rand_forest(mtry = 20, trees = 500, min_n = 5) %>%
+  set_engine("ranger") %>%
+  set_mode("classification")
+
+recipe_spec <- recipe(cuisine ~ ., data = train_df) %>%
+  update_role(id, new_role = "id") %>%
+  step_zv(all_predictors())
+
+wf <- workflow() %>%
+  add_recipe(recipe_spec) %>%
+  add_model(rf_model)
+
+rf_fit <- wf %>% fit(train_df)
+
+# -----------------------------
+# 6. Predict on test set
+# -----------------------------
+preds <- predict(rf_fit, test_df) %>%
+  bind_cols(test_df %>% select(id))
+
+# -----------------------------
+# 7. Create Kaggle submission
+# -----------------------------
+submission <- preds %>%
+  select(id, .pred_class) %>%
+  rename(cuisine = .pred_class)
+
+write_csv(submission, "rf_submission.csv")
+
+```
