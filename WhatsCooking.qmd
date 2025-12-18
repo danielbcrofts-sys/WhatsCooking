@@ -14,9 +14,17 @@ library(tidytext)
 library(tidymodels)
 library(stringr)
 library(textrecipes)
+library(glmnet)
+library(janitor)
+library(xgboost)
+library(Matrix)
+library(ranger)
+library(LiblineaR)
+
 
 train_raw <- fromJSON("train.json")
 test_raw  <- fromJSON("test.json")
+glimpse(train_raw)
 
 
 train_tidy <- train_raw %>%
@@ -26,95 +34,336 @@ train_tidy <- train_raw %>%
 test_tidy <- test_raw %>%
   unnest(ingredients) %>%
   rename(ingredient = ingredients)
+
 ```
 
 ## Feature Engineering
+
 ```{r}
 
-# ---- Feature 1: number of ingredients ----
-feat_count_train <- train_tidy %>%
+
+# train_clean <- train_tidy %>%
+#   mutate(ingredient = ingredient %>%
+#            str_to_lower() %>%
+#            str_replace_all("[^a-z0-9 ]", " ") %>%
+#            str_squish())
+# 
+# test_clean <- test_tidy %>%
+#   mutate(ingredient = ingredient %>%
+#            str_to_lower() %>%
+#            str_replace_all("[^a-z0-9 ]", " ") %>%
+#            str_squish())
+# 
+# 
+# # top 500 
+
+# top500 <- train_clean %>%
+#   count(ingredient, sort = TRUE) %>%
+#   slice_head(n = 500) %>%
+#   pull(ingredient)
+# 
+#
+# # Ingredient presence
+#
+# feat_ing_train <- train_clean %>%
+#   mutate(ingredient = if_else(ingredient %in% top500, ingredient, "OTHER")) %>%
+#   distinct(id, cuisine, ingredient) %>% 
+#   mutate(value = 1) %>%           
+#   pivot_wider(
+#     names_from = ingredient,
+#     values_from = value,
+#     values_fill = 0
+#   )
+# 
+# feat_ing_test <- test_clean %>%
+#   mutate(ingredient = if_else(ingredient %in% top500, ingredient, "OTHER")) %>%
+#   distinct(id, ingredient) %>% 
+#   mutate(value = 1) %>%
+#   pivot_wider(
+#     names_from = ingredient,
+#     values_from = value,
+#     values_fill = 0
+#   )
+# 
+# 
+# # num_ingredients
+# 
+# feat_count_train <- train_clean %>%
+#   group_by(id, cuisine) %>%
+#   summarise(num_ingredients = n(), .groups = "drop")
+# 
+# feat_count_test <- test_clean %>%
+#   group_by(id) %>%
+#   summarise(num_ingredients = n(), .groups = "drop")
+# 
+# 
+# # Final combined train/test
+# 
+# train_df <- feat_ing_train %>%
+#   left_join(feat_count_train, by = c("id", "cuisine"))
+# 
+# test_df <- feat_ing_test %>%
+#   left_join(feat_count_test, by = "id")
+# 
+# # Make cuisine a factor
+# train_df$cuisine <- as.factor(train_df$cuisine)
+
+```
+
+## SVM (Best one. Comment out all feature engineering for this model)
+
+```{r}
+
+train_docs <- train_tidy %>%
   group_by(id, cuisine) %>%
-  summarize(num_ingredients = n(), .groups = "drop")
+  summarise(text = paste(ingredient, collapse = " "), .groups = "drop")
 
-feat_count_test <- test_tidy %>%
+test_docs <- test_tidy %>%
   group_by(id) %>%
-  summarize(num_ingredients = n(), .groups = "drop")
+  summarise(text = paste(ingredient, collapse = " "), .groups = "drop")
 
-# ---- Feature 2: presence of soy sauce ----
-feat_soy_train <- train_tidy %>%
-  mutate(has_soy = ingredient == "soy sauce") %>%
-  group_by(id, cuisine) %>%
-  summarize(has_soy = as.integer(any(has_soy)), .groups = "drop")
+# Save test IDs now (recipe will strip them)
+test_ids <- test_docs$id
 
-feat_soy_test <- test_tidy %>%
-  mutate(has_soy = ingredient == "soy sauce") %>%
-  group_by(id) %>%
-  summarize(has_soy = as.integer(any(has_soy)), .groups = "drop")
+# 2. TF-IDF recipe
 
-# ---- Feature 3: Bag-of-words for top 200 ingredients ----
-top200 <- train_tidy %>%
-  count(ingredient, sort = TRUE) %>%
-  slice_head(n = 200) %>%
-  pull(ingredient)
+recipe_spec <- recipe(cuisine ~ text, data = train_docs) %>%
+  step_tokenize(text) %>%
+  step_tokenfilter(text, max_tokens = 3000) %>%
+  step_tfidf(text)
 
-feat_bow_train <- train_tidy %>%
-  mutate(ingredient = if_else(ingredient %in% top200, ingredient, "OTHER")) %>%
-  count(id, cuisine, ingredient) %>%
-  pivot_wider(
-    names_from = ingredient,
-    values_from = n,
-    values_fill = 0
-  )
+prep_rec <- prep(recipe_spec)
 
-feat_bow_test <- test_tidy %>%
-  mutate(ingredient = if_else(ingredient %in% top200, ingredient, "OTHER")) %>%
-  count(id, ingredient) %>%
-  pivot_wider(
-    names_from = ingredient,
-    values_from = n,
-    values_fill = 0
-  )
+train_mat <- bake(prep_rec, new_data = train_docs)
+test_mat  <- bake(prep_rec, new_data = test_docs)
 
-# -----------------------------
-# 4. Combine all feature sets
-# -----------------------------
-train_df <- feat_bow_train %>%
-  left_join(feat_count_train, by = c("id", "cuisine")) %>%
-  left_join(feat_soy_train, by = c("id", "cuisine"))
+# 3. Build matrices
 
-test_df <- feat_bow_test %>%
-  left_join(feat_count_test, by = "id") %>%
-  left_join(feat_soy_test, by = "id")
+x_train <- train_mat %>%
+  select(-cuisine) %>%
+  as.matrix()
+
+y_train <- train_mat$cuisine
+
+x_test <- test_mat %>%
+  as.matrix()
+
+# 4. Train SVM
+
+svm_model <- LiblineaR(
+  data = x_train,
+  target = y_train,
+  type = 7,
+  cost = 1
+)
+
+# 5. Predictions + Submission
+
+preds <- predict(svm_model, x_test)$predictions
+
+submission <- tibble(
+  id = test_ids,
+  cuisine = preds
+)
+
+write_csv(submission, "tfidf_svm_submission.csv")
+
+```
+
+## Logistic Regression
+
+```{r}
+
+glmnet_fit <- cv.glmnet(
+  x = train_mat,
+  y = y,
+  family = "multinomial",
+  type.measure = "class",   # cross-validation target
+  alpha = 0.5,              # elastic net: balance L1/L2
+  parallel = FALSE          # set TRUE if you have a parallel backend
+)
+
+# Best lambda
+best_lambda <- glmnet_fit$lambda.min
+best_lambda
+
+```
+
+## XGBoost
+
+```{r}
+
+train_clean <- train_df %>% clean_names()
+test_clean  <- test_df  %>% clean_names()
+
+
+# Align training and test feature columns
+
+# Remove ID and outcome from training predictors
+train_predictors <- train_clean %>% select(-cuisine, -id)
+test_predictors  <- test_clean  %>% select(-id)
+
+# Add missing columns to test (fill with 0)
+missing_cols <- setdiff(names(train_predictors), names(test_predictors))
+test_predictors[, missing_cols] <- 0
+
+# Remove extra columns from test (rare, but safe)
+extra_cols <- setdiff(names(test_predictors), names(train_predictors))
+test_predictors <- test_predictors[, !(names(test_predictors) %in% extra_cols)]
+
+# Reorder test columns to match train
+test_predictors <- test_predictors[, names(train_predictors)]
+
+# Convert to numeric matrices
+
+x <- train_predictors %>%
+  mutate(across(everything(), as.numeric)) %>%
+  as.matrix()
+
+x_test <- test_predictors %>%
+  mutate(across(everything(), as.numeric)) %>%
+  as.matrix()
+
+# Outcome: convert to 0:(K-1)
+y_factor <- factor(train_clean$cuisine)
+y <- as.integer(y_factor) - 1
+
+num_class <- length(levels(y_factor))
+
+# DMatrices
+dtrain <- xgb.DMatrix(data = x, label = y)
+dtest  <- xgb.DMatrix(data = x_test)
+
+# XGBoost parameters (fast version)
+
+params <- list(
+  objective = "multi:softprob",
+  eval_metric = "mlogloss",
+  num_class = num_class,
+  eta = 0.3,
+  max_depth = 4,
+  subsample = 0.8,
+  colsample_bytree = 0.8,
+  tree_method = "hist"
+)
+
+set.seed(123)
+xgb_model <- xgb.train(
+  params = params,
+  data = dtrain,
+  nrounds = 60,           
+  verbose = 1
+)
+
+# Predict on test set
+
+pred_probs <- predict(xgb_model, dtest)
+
+# Reshape probabilities into matrix
+pred_matrix <- matrix(pred_probs, ncol = num_class, byrow = TRUE)
+
+# Get predicted class (0-based)
+pred_idx <- max.col(pred_matrix) - 1
+
+# Convert to cuisine names
+pred_cuisine <- levels(y_factor)[pred_idx + 1]
+
+
+
+submission <- tibble(
+  id = test_clean$id,
+  cuisine = pred_cuisine
+)
+
+
+
+write_csv(submission, "submission_xgboost_fast.csv")
+
 
 
 ```
 
+## Linear SVM
+
+```{r}
+library(tidyverse)
+library(LiblineaR)
+library(janitor)
+
+# 1. Clean names
+
+train_clean <- train_df %>% clean_names()
+test_clean  <- test_df  %>% clean_names()
+
+# 2. Prepare matrices
+
+y <- factor(train_clean$cuisine)
+
+x <- train_clean %>%
+  select(-cuisine, -id) %>%
+  mutate(across(everything(), as.numeric)) %>%
+  as.matrix()
+
+x_test <- test_clean %>%
+  select(-id) %>%
+  mutate(across(everything(), as.numeric)) %>%
+  as.matrix()
+
+# 3. Fit multiclass Linear SVM (one-vs-rest)
+# Type = 0 → L2-regularized L2-loss SVM (primal) with cost parameter
+
+
+set.seed(123)
+
+svm_fit <- LiblineaR(
+  data = x,
+  target = y,
+  type = 0,      
+  cost = 1,   
+  bias = TRUE,
+  verbose = FALSE
+)
+
+# Predict om test set
+
+svm_preds <- predict(svm_fit, x_test, proba = TRUE)
+
+# Predict classes instead of probabilities
+svm_class <- predict(svm_fit, x_test)$predictions
+
+# Build correct Kaggle submission
+submission <- tibble(
+  id = test_clean$id,
+  cuisine = svm_class
+)
+
+# Write CSV
+write_csv(submission, "submission_svm.csv")
+
+
+```
 ## RF Model
 
 ```{r}
-rf_model <- rand_forest(mtry = 20, trees = 500, min_n = 5) %>%
+rf_model <- rand_forest(mtry = 40, trees = 50, min_n = 5) %>%
   set_engine("ranger") %>%
   set_mode("classification")
 
 recipe_spec <- recipe(cuisine ~ ., data = train_df) %>%
   update_role(id, new_role = "id") %>%
   step_zv(all_predictors())
-i
+
 wf <- workflow() %>%
   add_recipe(recipe_spec) %>%
   add_model(rf_model)
 
 rf_fit <- wf %>% fit(train_df)
 
-# -----------------------------
-# 6. Predict on test set
-# -----------------------------
+# predict on test set
 preds <- predict(rf_fit, test_df) %>%
   bind_cols(test_df %>% select(id))
 
-# -----------------------------
-# 7. Create Kaggle submission
-# -----------------------------
+
 submission <- preds %>%
   select(id, .pred_class) %>%
   rename(cuisine = .pred_class)
@@ -124,6 +373,7 @@ write_csv(submission, "rf_submission.csv")
 ```
 
 ## TFIDF
+
 ```{r}
 rec <- recipe(cuisine ~ ingredients, data = train_raw) %>%
   step_mutate(ingredients = tokenlist(ingredients)) %>%
